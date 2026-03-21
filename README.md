@@ -1,14 +1,9 @@
-# Strands Agents + Lambda Durable Functions
+# Strands Agents + Lambda durable functions
 
 [中文文档](README.zh-CN.md)
 
-Run [Strands](https://strandsagents.com/) AI agents on AWS Lambda with
-[Durable Functions](https://docs.aws.amazon.com/lambda/latest/dg/durable-functions.html)
+Run [Strands](https://strandsagents.com/) AI agents on [AWS Lambda durable functions](https://docs.aws.amazon.com/lambda/latest/dg/durable-functions.html)
 for fault-tolerant, long-running execution.
-
-> **Note:** Lambda Durable Functions is currently available in limited regions.
-> Check [regional availability](https://docs.aws.amazon.com/lambda/latest/dg/durable-functions.html)
-> before deploying.
 
 ## How It Works
 
