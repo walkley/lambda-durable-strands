@@ -75,12 +75,25 @@ Orchestrator (durable loop)
   └─ ctx.invoke(agent step)  ──► LLM returns end_turn ──► done (exit 0)
 ```
 
+The screenshot below shows a real execution in the Lambda console for the
+prompt "calculate 123 * 456 + 789". The durable runtime recorded three
+operations — the first LLM call that returned a `toolUse`, the calculator
+tool execution, and the final LLM call that produced the answer:
+
+![Durable execution steps](lambda_durable_strands_events.png)
+
 ### Session Persistence
 
 Session state (conversation history) is persisted to S3 via
 `S3SessionManager`. When the agent step Lambda is invoked again after a
 checkpoint, it loads the session from S3 and resumes with `agent(None)` —
 the SDK detects existing history and continues from where it left off.
+
+> `S3SessionManager` is used here as an example. The Strands Agents SDK also
+> includes `FileSessionManager` and supports third-party session manager
+> implementations. See
+> [Session Management](https://strandsagents.com/docs/user-guide/concepts/agents/session-management/)
+> for details.
 
 ## Project Structure
 

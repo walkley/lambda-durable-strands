@@ -65,11 +65,21 @@ Orchestrator（持久化循环）
   └─ ctx.invoke(agent step)  ──► LLM 返回 end_turn   ──► 完成 (exit 0)
 ```
 
+下图是 Lambda 控制台中 prompt "calculate 123 * 456 + 789" 的实际运行截图。
+Durable 运行时记录了三个操作 — 第一次 LLM 调用返回 `toolUse`、calculator
+工具执行、以及最终 LLM 调用生成答案：
+
+![Durable execution 运行步骤](lambda_durable_strands_events.png)
+
 ### 会话持久化
 
 会话状态（对话历史）通过 `S3SessionManager` 持久化到 S3。当 Agent Step Lambda 在
 checkpoint 后再次被调用时，它从 S3 加载会话并以 `agent(None)` 恢复 — SDK 检测到
 已有历史记录后会从上次中断的地方继续执行。
+
+> 这里使用 `S3SessionManager` 仅作为示例。Strands Agents SDK 还内置了
+> `FileSessionManager`，也支持第三方 session manager 实现，可根据实际需求替换。
+> 详见 [Session Management](https://strandsagents.com/docs/user-guide/concepts/agents/session-management/)。
 
 ## 项目结构
 
