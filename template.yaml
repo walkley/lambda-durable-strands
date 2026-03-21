@@ -1,0 +1,66 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Strands Agent + Durable Functions — orchestrator invokes agent step
+
+Resources:
+  # ── Orchestrator (Durable Function, Node.js) ──
+  OrchestratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: handler.handler
+      CodeUri: lambda_orchestrator/
+      Architectures: [arm64]
+      Timeout: 900
+      MemorySize: 256
+      AutoPublishAlias: live
+      Environment:
+        Variables:
+          SESSION_BUCKET: !Ref SessionBucket
+          SESSION_PREFIX: sessions/
+          AGENT_STEP_FUNCTION: !GetAtt AgentStepFunction.Arn
+      Policies:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicDurableExecutionRolePolicy
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AgentStepFunction
+      DurableConfig:
+        ExecutionTimeout: 3600
+        RetentionPeriodInDays: 7
+
+  # ── Agent Step (regular Lambda) ──
+  AgentStepFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.13
+      Handler: handler.handler
+      CodeUri: lambda_agent/
+      Architectures: [arm64]
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:856699698935:layer:strands-agents-py3_13-aarch64:1
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          SESSION_BUCKET: !Ref SessionBucket
+          SESSION_PREFIX: sessions/
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref SessionBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+              Resource: '*'
+
+  # ── S3 Session Storage ──
+  SessionBucket:
+    Type: AWS::S3::Bucket
+
+Outputs:
+  OrchestratorAlias:
+    Value: !Ref OrchestratorFunction.Alias
+  AgentStepFunction:
+    Value: !GetAtt AgentStepFunction.Arn
+  SessionBucket:
+    Value: !Ref SessionBucket
