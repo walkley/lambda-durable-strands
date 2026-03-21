@@ -1,13 +1,10 @@
-# Strands Agents + Lambda Durable Functions
+# Strands Agents + Lambda durable functions
 
 [English](README.md)
 
 在 AWS Lambda 上运行 [Strands](https://strandsagents.com/) AI Agent，借助
-[Durable Functions](https://docs.aws.amazon.com/lambda/latest/dg/durable-functions.html)
+[durable functions](https://docs.aws.amazon.com/lambda/latest/dg/durable-functions.html)
 实现容错、可中断的长时间执行。
-
-> **注意：** Lambda Durable Functions 目前仅在部分区域可用，部署前请查看
-> [区域可用性](https://docs.aws.amazon.com/lambda/latest/dg/durable-functions.html)。
 
 ## 工作原理
 
