@@ -1,0 +1,21 @@
+# SAM build output
+.aws-sam/
+
+# SAM deploy config (generated)
+samconfig.toml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node.js
+node_modules/
+
+# Environment / secrets
+.env
+.env.*
+
+# OS / editor
+.DS_Store

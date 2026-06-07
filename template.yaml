@@ -36,7 +36,8 @@ Resources:
       CodeUri: lambda_agent/
       Architectures: [arm64]
       Layers:
-        - !Sub arn:aws:lambda:${AWS::Region}:856699698935:layer:strands-agents-py3_13-aarch64:1
+        # strands-agents layer (v2 = v1.40.0). Any version with stream_async works.
+        - !Sub arn:aws:lambda:${AWS::Region}:856699698935:layer:strands-agents-py3_13-aarch64:2
       Timeout: 900
       MemorySize: 512
       Environment:

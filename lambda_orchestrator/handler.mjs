@@ -1,5 +1,11 @@
 /**
  * Orchestrator Lambda (Durable Function) — loops invoking agent_step until done.
+ *
+ * The agent step runs the Strands agent until the next tool boundary (toolUse or
+ * toolResult) and returns `{ status: "checkpoint", checkpoint_type, tool_name }`.
+ * The orchestrator re-invokes the step with only the session id; the agent restores
+ * history from S3 and continues. Each ctx.invoke() is checkpointed by the durable runtime,
+ * so every LLM call and every tool execution becomes its own durable step.
  */
 import { withDurableExecution } from "@aws/durable-execution-sdk-js";
 
@@ -64,6 +70,7 @@ export const handler = withDurableExecution(async (event, ctx) => {
         stepName = "agent-step";
       }
 
+      // Resume carries only the session; the agent restores history from S3.
       stepPayload = {
         session_id: sessionId,
         bucket: SESSION_BUCKET,

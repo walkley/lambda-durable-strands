@@ -5,90 +5,138 @@
 Run [Strands](https://strandsagents.com/) AI agents on [AWS Lambda durable functions](https://docs.aws.amazon.com/lambda/latest/dg/durable-functions.html)
 for fault-tolerant, long-running execution.
 
+## Background
+
+Durable execution for AI agents has become a cross-ecosystem pattern.
+[Temporal](https://temporal.io/), [DBOS](https://www.dbos.dev/),
+[Restate](https://restate.dev/), Inngest, [LangGraph](https://www.langchain.com/langgraph),
+Cloudflare Durable Objects, and
+[AWS Lambda durable functions](https://aws.amazon.com/blogs/aws/build-multi-step-applications-and-ai-workflows-with-aws-lambda-durable-functions)
+all tackle the same problem: agent runs are getting long (minutes to hours), a
+crash loses progress and re-burns tokens, and human-in-the-loop needs long
+pauses. The shared principle is to checkpoint at every meaningful step — each
+LLM call, each tool result — and replay idempotently from the last checkpoint
+rather than starting over.
+
+This project applies that pattern on AWS Lambda durable functions, where the
+key question is checkpoint granularity. The official
+[sample-ai-workflows-in-aws-lambda-durable-functions](https://github.com/aws-samples/sample-ai-workflows-in-aws-lambda-durable-functions)
+repo wraps an entire Strands agent call in a single durable step — simple, but
+coarse: a failure reruns everything and you still hit the 15-minute
+single-invocation limit. Here, every LLM call and every tool execution is its
+own durable step. It does this without rewriting the agent loop or resorting to
+subprocess / `os._exit()` hacks: `stream_async` exposes the loop as an event
+stream, and the Lambda breaks at message boundaries — which also works for
+remote MCP tools.
+
 ## How It Works
 
-### The Problem
+### The Challenge
 
 A Strands agent's event loop — LLM call → tool execution → LLM call → ... —
-runs as a single, continuous process. Lambda Durable Functions can checkpoint
-and resume a function, but only at explicit `ctx.step()` / `ctx.invoke()`
-boundaries. There is no way to inject a durable checkpoint into the middle of
-the Strands event loop from the outside.
+runs as a single continuous process. Durable functions checkpoint only at
+explicit `ctx.step()` / `ctx.invoke()` boundaries, with no built-in way to
+checkpoint in the middle of the loop.
 
-### Why Two Lambdas
+### Architecture
 
-The Durable Functions SDK supports both JavaScript and Python. This project
-uses a Node.js orchestrator + Python agent step to demonstrate that Lambdas
-in different languages can work together within Durable Functions.
+The work is split across two Lambdas:
 
-So the architecture splits into:
+- **Orchestrator** (Node.js, durable function) — owns the durable loop; calls
+  `ctx.invoke()` to run the agent step on each iteration. Every invoke is
+  checkpointed automatically by the durable runtime.
+- **Agent Step** (Python, regular Lambda) — runs the Strands agent until the
+  next tool boundary, then returns control.
 
-- **Orchestrator** (Node.js, Durable Function) — owns the durable loop, calls
-  `ctx.invoke()` to run the agent step Lambda on each iteration. Each invoke is
-  automatically checkpointed by the durable runtime.
-- **Agent Step** (Python, regular Lambda) — runs the Strands agent for exactly
-  one step (one LLM call + one tool execution), then returns control to the
-  orchestrator.
+The durable execution SDK supports both JavaScript and Python; using both here
+demonstrates cross-language collaboration within one durable execution.
 
-This turns the agent's continuous event loop into a series of discrete,
-durable steps.
+### Pause Mechanism
 
-### Why a Subprocess + `os._exit()`
+`agent.stream_async()` exposes the event loop as an async event stream. Rather
+than stopping the loop from inside a hook, the Agent Step consumes the stream
+and stops iterating at the first tool boundary — a plain `break`, with no
+subprocess, `os._exit()`, OS pipe, or exit codes.
 
-The Strands agent event loop is not designed to pause mid-execution. Once
-`agent(prompt)` is called, it runs until the LLM returns `end_turn`. There is
-no built-in "pause after this tool call and return" API.
+A lightweight `CheckpointDetector` on `MessageAddedEvent` records the first
+boundary it sees:
 
-To force a pause, the Agent Step Lambda uses a `CheckpointHook` that listens
-for `MessageAddedEvent`. When a `toolUse` or `toolResult` message is detected,
-the hook needs to stop the agent immediately. But:
+| Boundary | Fires when | Meaning |
+| --- | --- | --- |
+| `toolUse` | an assistant message contains a `toolUse` block | the LLM call is done; the tool has not run yet |
+| `toolResult` | a user message contains a `toolResult` block | the tool has run; the next LLM call has not started |
 
-- Raising an exception would be caught by the Strands event loop internals.
-- Setting a flag and waiting for a clean exit point doesn't exist in the
-  current SDK.
-- `os._exit()` terminates the process instantly, bypassing all exception
-  handlers and cleanup — exactly what we need.
+Both are event-loop level signals, independent of where a tool is defined —
+they fire for local tools and remote MCP tools alike.
 
-The problem is that `os._exit()` would kill the Lambda runtime itself,
-preventing it from returning a response. So the agent runs in a **subprocess**:
+> The SDK's interrupt mechanism is not used: a `BeforeToolCallEvent` interrupt
+> offers only the "before tool" boundary (too coarse), and tool-level interrupts
+> require modifying the tool body, which isn't possible for MCP tools.
 
-1. The Lambda handler (parent process) spawns a subprocess to run the agent.
-2. The subprocess's `CheckpointHook` detects a tool message, writes checkpoint
-   metadata to an OS pipe, and calls `os._exit(42)`.
-3. The parent process reads the pipe, sees exit code 42, and returns
-   `{"status": "checkpoint", ...}` to the orchestrator.
-4. On normal completion (exit code 0), the subprocess writes the final result
-   to the same pipe before exiting.
+### Execution Flow
+
+1. The Agent Step drives `agent.stream_async(prompt)`. The LLM returns a
+   `toolUse`, the detector records the boundary, and the Lambda exits the stream.
+2. It returns `{"status": "checkpoint", "checkpoint_type": "toolUse",
+   "tool_name": ...}` to the orchestrator.
+3. The orchestrator re-invokes the Agent Step with only the session id.
+4. The Lambda restores history from S3 and drives `agent.stream_async(None)`.
+   The tool runs, and the loop reaches the next `toolResult` boundary (exit
+   again) or `end_turn` (done).
 
 ```
 Orchestrator (durable loop)
   │
-  ├─ ctx.invoke(agent step)  ──► LLM returns toolUse  ──► checkpoint (exit 42)
-  ├─ ctx.invoke(agent step)  ──► tool runs, toolResult ──► checkpoint (exit 42)
-  ├─ ctx.invoke(agent step)  ──► LLM returns toolUse  ──► checkpoint (exit 42)
+  ├─ ctx.invoke(agent step, prompt)  ──► LLM returns toolUse  ──► break → checkpoint (toolUse)
+  ├─ ctx.invoke(agent step, session) ──► tool runs, toolResult ──► break → checkpoint (toolResult)
+  ├─ ctx.invoke(agent step, session) ──► LLM returns toolUse  ──► break → checkpoint (toolUse)
   ├─ ...
-  └─ ctx.invoke(agent step)  ──► LLM returns end_turn ──► done (exit 0)
+  └─ ctx.invoke(agent step, session) ──► LLM returns end_turn ──► done
 ```
 
-The screenshot below shows a real execution in the Lambda console for the
-prompt "calculate 123 * 456 + 789". The durable runtime recorded three
-operations — the first LLM call that returned a `toolUse`, the calculator
-tool execution, and the final LLM call that produced the answer:
+Because the loop breaks at both the `toolUse` and `toolResult` boundaries, every
+LLM call and every tool execution becomes its own durable step. The screenshot
+below is a real execution for the prompt "calculate 123 * 456 + 789": the
+durable runtime recorded three steps — the LLM call that returned a `toolUse`,
+the calculator execution, and the final LLM call that produced the answer.
 
 ![Durable execution steps](lambda_durable_strands_events.png)
 
 ### Session Persistence
 
-Session state (conversation history) is persisted to S3 via
-`S3SessionManager`. When the agent step Lambda is invoked again after a
-checkpoint, it loads the session from S3 and resumes with `agent(None)` —
-the SDK detects existing history and continues from where it left off.
+Session state (conversation history) is persisted to S3 by `S3SessionManager`,
+which writes each message as it is added (`MessageAddedEvent`). That write
+happens before the corresponding event reaches the stream consumer, so whenever
+the Lambda breaks, the boundary message is already in S3. On the next invocation
+the agent loads history from S3 and resumes with `agent.stream_async(None)`; the
+tool runs exactly once, in the resume step.
 
-> `S3SessionManager` is used here as an example. The Strands Agents SDK also
-> includes `FileSessionManager` and supports third-party session manager
-> implementations. See
+> `S3SessionManager` is one option. The SDK also ships `FileSessionManager` and
+> supports custom session managers. See
 > [Session Management](https://strandsagents.com/docs/user-guide/concepts/agents/session-management/)
 > for details.
+
+### Native Checkpoint Support (Roadmap)
+
+The SDK is building first-class durable-execution support for exactly this use
+case: an experimental `strands.experimental.checkpoint` module plus a
+`"checkpoint"` stop reason, tracked in
+[strands-agents/sdk-python#1369](https://github.com/strands-agents/sdk-python/issues/1369).
+Its design matches what this project does by hand:
+
+- the same two cycle boundaries, `after_model` and `after_tools`, which are this
+  project's `toolUse` and `toolResult`;
+- a `Checkpoint` is only a boundary marker — conversation state is left to a
+  `SessionManager`, the same split used here (`S3SessionManager` for state);
+- resume mirrors interrupts, via a `checkpointResume` content block and
+  `stop_reason="checkpoint"`;
+- per-tool granularity is delegated to a custom `ToolExecutor`.
+
+As of the latest release (1.42.0) only the data types and the `"checkpoint"`
+stop reason exist; the pause/resume is not yet wired into the event loop, so
+this project drives the loop with `stream_async`. Once the native API lands, the
+agent step can switch to it without changing the orchestrator or the
+two-boundary model.
 
 ## Project Structure
 
@@ -111,7 +159,7 @@ cleanup.sh                            — Empty S3 and delete stack
 
 ```bash
 ./deploy.sh                    # default stack name: strands-durable-poc
-./deploy.sh my-stack              # custom stack name
+./deploy.sh my-stack           # custom stack name
 ```
 
 ## Test

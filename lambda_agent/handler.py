@@ -1,10 +1,24 @@
-"""Agent Step Lambda — runs agent in subprocess, os._exit(42) on checkpoint."""
+"""Agent Step Lambda — drives the Strands agent via stream_async, pausing at tool boundaries.
 
-import json
+The agent loop is exposed as an async event stream (`agent.stream_async`). The Lambda
+consumes that stream and simply stops iterating at the first tool boundary, which hands
+control back cleanly — no subprocess, no os._exit. State is persisted to S3 by
+S3SessionManager as each message is added, so the next invocation resumes from history
+with `stream_async(None)`.
+
+Two boundaries are detected, matching a durable step to each LLM call and each tool run:
+- toolUse:    an assistant message containing a toolUse block (stop BEFORE the tool runs)
+- toolResult: a user message containing a toolResult block (stop BEFORE the next LLM call)
+
+Both are event-loop level signals, so they fire for any tool — local or a remote MCP
+tool whose body the app does not control. To add an MCP server, load its tools alongside
+the local ones and run the agent inside the client's context manager; the checkpoint and
+resume logic here is unchanged.
+"""
+
+import asyncio
 import logging
 import os
-import subprocess
-import sys
 from datetime import datetime
 
 from strands import Agent, tool
@@ -17,7 +31,6 @@ log.setLevel(logging.INFO)
 
 SESSION_BUCKET = os.environ.get("SESSION_BUCKET", "")
 SESSION_PREFIX = os.environ.get("SESSION_PREFIX", "sessions/")
-EXIT_CODE_CHECKPOINT = 42
 
 
 # ── Tools ──────────────────────────────────────────────────────────────
@@ -47,6 +60,8 @@ def shell(command: str) -> str:
     Args:
         command: The shell command to execute.
     """
+    import subprocess
+
     r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=720, check=False)
     output = r.stdout.strip()
     if r.returncode != 0:
@@ -71,56 +86,43 @@ def sleep_seconds(seconds: int) -> str:
 ALL_TOOLS = [current_time, calculator, shell, sleep_seconds]
 
 
-# ── Checkpoint Hook ────────────────────────────────────────────────────
+# ── Checkpoint Detection ───────────────────────────────────────────────
 
-class CheckpointHook:
-    """Trigger os._exit() on toolUse/toolResult to create a checkpoint.
+class CheckpointDetector:
+    """Record the first tool boundary seen, so the driver knows where to stop.
 
-    Both checkpoints are driven by MessageAddedEvent:
-    - toolUse: assistant message contains toolUse → session persisted → exit
-    - toolResult: user message contains toolResult → session persisted → exit
-
-    Checkpoint details are sent back to the parent process via pipe (w_fd).
+    Registered on MessageAddedEvent. The session manager is also a MessageAddedEvent
+    consumer, so by the time the driver observes the next streamed event the message
+    is already written to S3 — the break point is durable.
     """
 
-    def __init__(self, exit_code, w_fd):
-        self._exit_code = exit_code
-        self._w_fd = w_fd
-
-    def _send_and_exit(self, checkpoint_type, tool_name):
-        """Write checkpoint info to pipe, then exit."""
-        with os.fdopen(self._w_fd, "w") as f:
-            json.dump({"checkpoint_type": checkpoint_type, "tool_name": tool_name}, f)
-        os._exit(self._exit_code)
+    def __init__(self):
+        self.checkpoint = None
 
     def on_message_added(self, event: MessageAddedEvent) -> None:
-        """Detect toolUse and toolResult messages, trigger checkpoint."""
+        if self.checkpoint is not None:
+            return
         msg = event.message
         role = msg.get("role", "")
-        content = msg.get("content", [])
-
-        if role == "assistant":
-            for block in content:
-                if isinstance(block, dict) and "toolUse" in block:
-                    name = block["toolUse"].get("name", "unknown")
-                    log.info("checkpoint: toolUse detected (%s)", name)
-                    self._send_and_exit("toolUse", name)
-
-        if role == "user":
-            for block in content:
-                if isinstance(block, dict) and "toolResult" in block:
-                    # toolResult only contains toolUseId, no tool name
-                    # orchestrator uses the tool_name from the previous toolUse
-                    log.info("checkpoint: toolResult detected")
-                    self._send_and_exit("toolResult", "")
+        for block in msg.get("content", []):
+            if not isinstance(block, dict):
+                continue
+            if role == "assistant" and "toolUse" in block:
+                name = block["toolUse"].get("name", "unknown")
+                log.info("checkpoint: toolUse detected (%s)", name)
+                self.checkpoint = {"checkpoint_type": "toolUse", "tool_name": name}
+                return
+            if role == "user" and "toolResult" in block:
+                log.info("checkpoint: toolResult detected")
+                self.checkpoint = {"checkpoint_type": "toolResult", "tool_name": ""}
+                return
 
 
-# ── Agent Runner (subprocess entry point) ──────────────────────────────
+# ── Agent Runner ───────────────────────────────────────────────────────
 
-def _run_agent(session_id, prompt, bucket, prefix, exit_code, w_fd):
-    """Run agent in subprocess. os._exit on checkpoint, write result to pipe on completion."""
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    hook = CheckpointHook(exit_code, w_fd)
+async def _run(session_id, prompt, bucket, prefix):
+    """Drive the agent stream until the first tool boundary or normal completion."""
+    detector = CheckpointDetector()
 
     agent = Agent(
         model=BedrockModel(),
@@ -130,69 +132,44 @@ def _run_agent(session_id, prompt, bucket, prefix, exit_code, w_fd):
         ),
         system_prompt="You are a helpful assistant. Use tools when asked. Be concise.",
     )
-    agent.hooks.add_callback(MessageAddedEvent, hook.on_message_added)
+    agent.hooks.add_callback(MessageAddedEvent, detector.on_message_added)
 
     has_history = bool(agent.messages)
     effective_prompt = prompt if not has_history else None
     log.info("agent: sid=%s, messages=%d, %s",
              session_id, len(agent.messages), "resume" if has_history else "start")
 
-    result = agent(effective_prompt)
+    final_result = None
+    stream = agent.stream_async(effective_prompt)
+    try:
+        async for event in stream:
+            # The boundary message is already persisted; stop before the loop advances.
+            if detector.checkpoint is not None:
+                break
+            if isinstance(event, dict) and "result" in event:
+                final_result = event["result"]
+    finally:
+        await stream.aclose()
 
-    output = {"response": str(result)[:2000], "messages": len(agent.messages)}
-    with os.fdopen(w_fd, "w") as f:
-        json.dump(output, f)
+    if detector.checkpoint is not None:
+        return {"status": "checkpoint", **detector.checkpoint}
+
+    return {
+        "status": "done",
+        "response": str(final_result)[:2000] if final_result is not None else "",
+        "messages": len(agent.messages),
+    }
 
 
 # ── Lambda Handler ─────────────────────────────────────────────────────
 
 def handler(event, context):  # noqa: ARG001
-    """Lambda entry point. Runs agent in subprocess, checks exit code."""
-    log.info("event: %s", json.dumps(event, default=str)[:500])
+    """Lambda entry point. Runs one agent segment until a tool boundary or completion."""
+    log.info("event: %s", str(event)[:500])
 
     session_id = event["session_id"]
     prompt = event.get("prompt")
     bucket = event.get("bucket", SESSION_BUCKET)
     prefix = event.get("prefix", SESSION_PREFIX)
 
-    # pipe: parent reads r_fd, child writes w_fd
-    r_fd, w_fd = os.pipe()
-
-    proc = subprocess.run(
-        [
-            sys.executable, "-c",
-            f"from handler import _run_agent; "
-            f"_run_agent({session_id!r}, {prompt!r}, {bucket!r}, {prefix!r}, "
-            f"{EXIT_CODE_CHECKPOINT}, {w_fd})",
-        ],
-        timeout=840,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        pass_fds=(w_fd,),
-        cwd=os.path.dirname(__file__) or ".",
-        env={**os.environ, "PYTHONPATH": ":".join(sys.path)},
-    )
-
-    os.close(w_fd)  # close write end in parent
-
-    if proc.stdout:
-        log.info("subprocess stdout: %s", proc.stdout[-2000:])
-    if proc.stderr:
-        log.info("subprocess stderr: %s", proc.stderr[-2000:])
-    log.info("exit_code=%d", proc.returncode)
-
-    # read subprocess data from pipe
-    with os.fdopen(r_fd, "r") as f:
-        pipe_data = f.read()
-
-    if proc.returncode == 0:
-        output = json.loads(pipe_data) if pipe_data else {}
-        return {"status": "done", **output}
-
-    if proc.returncode == EXIT_CODE_CHECKPOINT:
-        checkpoint_info = json.loads(pipe_data) if pipe_data else {}
-        return {"status": "checkpoint", **checkpoint_info}
-
-    return {"status": "error", "exit_code": proc.returncode}
+    return asyncio.run(_run(session_id, prompt, bucket, prefix))
